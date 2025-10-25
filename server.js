@@ -2,10 +2,16 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const axios = require('axios');
+const OpenAI = require('openai');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 // Middleware
 app.use(cors());
@@ -17,7 +23,7 @@ if (process.env.MONGODB_URI) {
     .then(() => console.log('✅ Connected to MongoDB'))
     .catch(err => console.error('❌ MongoDB connection error:', err));
 } else {
-  console.warn('⚠️  MONGODB_URI not set');
+  console.warn('⚠️ MONGODB_URI not set');
 }
 
 // MongoDB Schemas
@@ -43,31 +49,93 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     time: new Date().toISOString(),
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    openai: process.env.OPENAI_API_KEY ? 'configured' : 'not configured'
   });
 });
 
-// Query Router - Routes queries to appropriate API
-function routeQuery(query) {
-  const lowerQuery = query.toLowerCase();
-  
-  if (lowerQuery.includes('weather') || lowerQuery.includes('temperature')) {
-    return 'weather';
-  } else if (lowerQuery.includes('time') || lowerQuery.includes('date')) {
-    return 'time';
-  } else if (lowerQuery.match(/\d+\s*[+\-*/]\s*\d+/)) {
-    return 'math';
-  } else if (lowerQuery.includes('who is') || lowerQuery.includes('what is') || lowerQuery.includes('define')) {
-    return 'knowledge';
-  } else {
-    return 'general';
+// OpenAI Chat with Real-time Search
+async function chatWithOpenAI(message, useSearch = false) {
+  try {
+    const messages = [
+      {
+        role: 'system',
+        content: 'You are a helpful AI assistant. Provide accurate, concise, and friendly responses. If asked about current events or real-time information, indicate that you may not have the latest data.'
+      },
+      {
+        role: 'user',
+        content: message
+      }
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: messages,
+      max_tokens: 500,
+      temperature: 0.7
+    });
+
+    return completion.choices[0].message.content;
+  } catch (error) {
+    console.error('OpenAI Error:', error.message);
+    if (error.status === 401) {
+      return 'OpenAI API key is not configured. Please add OPENAI_API_KEY to environment variables.';
+    }
+    return 'I encountered an error processing your request. Please try again.';
+  }
+}
+
+// Web Search with OpenAI Analysis
+async function searchWithOpenAI(query) {
+  try {
+    // First, get web search results from DuckDuckGo
+    const searchResults = await searchDuckDuckGo(query);
+    
+    if (!searchResults || searchResults === 'No results found.' || searchResults === 'Search unavailable.') {
+      // Fallback to OpenAI without search context
+      return await chatWithOpenAI(query);
+    }
+
+    // Use OpenAI to synthesize search results
+    const messages = [
+      {
+        role: 'system',
+        content: 'You are a helpful search assistant. Synthesize the provided search results into a clear, concise answer.'
+      },
+      {
+        role: 'user',
+        content: `User query: ${query}\n\nSearch results: ${searchResults}\n\nProvide a clear answer based on these results.`
+      }
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: messages,
+      max_tokens: 300,
+      temperature: 0.5
+    });
+
+    return completion.choices[0].message.content;
+  } catch (error) {
+    console.error('Search with OpenAI Error:', error.message);
+    return await chatWithOpenAI(query);
+  }
+}
+
+// DuckDuckGo Instant Answer
+async function searchDuckDuckGo(query) {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`;
+    const res = await axios.get(url);
+    return res.data.AbstractText || res.data.Answer || 'No results found.';
+  } catch (error) {
+    return 'Search unavailable.';
   }
 }
 
 // Weather API
 async function getWeather(location = 'London') {
   try {
-    // Using free Open-Meteo API
     const geocodeUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
     const geoRes = await axios.get(geocodeUrl);
     
@@ -96,18 +164,7 @@ async function searchWikipedia(query) {
   }
 }
 
-// DuckDuckGo Instant Answer
-async function searchDuckDuckGo(query) {
-  try {
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`;
-    const res = await axios.get(url);
-    return res.data.AbstractText || res.data.Answer || 'No results found.';
-  } catch (error) {
-    return 'Search unavailable.';
-  }
-}
-
-// Chat endpoint
+// Chat endpoint with OpenAI
 app.post('/api/chat', async (req, res) => {
   try {
     const { userId = 'anonymous', message } = req.body;
@@ -116,54 +173,38 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    // Route query
-    const queryType = routeQuery(message);
-    let response = '';
-
-    switch (queryType) {
-      case 'weather':
-        const location = message.match(/in ([a-zA-Z\s]+)/)?.[1] || 'London';
-        response = await getWeather(location);
-        break;
-      
-      case 'time':
-        const now = new Date();
-        response = `Current time: ${now.toLocaleString()}`;
-        break;
-      
-      case 'math':
-        try {
-          const result = eval(message.match(/[\d+\-*/().\s]+/)[0]);
-          response = `The answer is: ${result}`;
-        } catch {
-          response = 'Could not calculate that.';
-        }
-        break;
-      
-      case 'knowledge':
-        const topic = message.replace(/(who is|what is|define)/gi, '').trim();
-        response = await searchWikipedia(topic);
-        break;
-      
-      case 'general':
-      default:
-        response = await searchDuckDuckGo(message);
-        if (!response || response === 'No results found.') {
-          response = `I received your message: "${message}". I'm working on understanding more complex queries!`;
-        }
-        break;
-    }
-
+    // Use OpenAI for intelligent responses
+    const response = await chatWithOpenAI(message);
+    
     // Save to database
     if (mongoose.connection.readyState === 1) {
       const chat = new Chat({ userId, message, response });
       await chat.save();
     }
 
-    res.json({ success: true, response, queryType });
+    res.json({ success: true, response });
   } catch (error) {
     console.error('Chat error:', error);
     res.status(500).json({ error: 'Server error', message: error.message });
+  }
+});
+
+// Enhanced Search endpoint with OpenAI
+app.post('/api/search', async (req, res) => {
+  try {
+    const { query } = req.body;
+    
+    if (!query) {
+      return res.status(400).json({ error: 'Query is required' });
+    }
+
+    // Use OpenAI-enhanced search
+    const results = await searchWithOpenAI(query);
+    
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ error: 'Search failed', message: error.message });
   }
 });
 
@@ -180,22 +221,26 @@ app.get('/api/chat/history', async (req, res) => {
   }
 });
 
-// Voice endpoint (same as chat)
+// Voice endpoint (uses same chat logic)
 app.post('/api/voice', async (req, res) => {
-  // Reuse chat logic for voice queries
-  return app._router.handle(req, res, (err) => {
-    if (err) res.status(500).json({ error: err.message });
-  });
-});
-
-// Search endpoint
-app.post('/api/search', async (req, res) => {
   try {
-    const { query } = req.body;
-    const results = await searchDuckDuckGo(query);
-    res.json({ success: true, results });
+    const { userId = 'anonymous', message } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    const response = await chatWithOpenAI(message);
+    
+    if (mongoose.connection.readyState === 1) {
+      const chat = new Chat({ userId, message, response });
+      await chat.save();
+    }
+
+    res.json({ success: true, response });
   } catch (error) {
-    res.status(500).json({ error: 'Search failed' });
+    console.error('Voice error:', error);
+    res.status(500).json({ error: 'Server error', message: error.message });
   }
 });
 
@@ -221,10 +266,9 @@ app.get('/api/reminders', async (req, res) => {
   }
 });
 
-// News endpoint (using free API)
+// News endpoint
 app.get('/api/news', async (req, res) => {
   try {
-    // Using free news aggregator
     const category = req.query.category || 'general';
     res.json({ 
       success: true, 
@@ -238,6 +282,7 @@ app.get('/api/news', async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`\ud83d\ude80 Server running on port ${PORT}`);
+  console.log(`\ud83d\udccd Health check: http://localhost:${PORT}/health`);
+  console.log(`\ud83e\udd16 OpenAI: ${process.env.OPENAI_API_KEY ? 'Configured' : 'Not configured'}`);
 });
